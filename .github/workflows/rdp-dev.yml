@@ -1,0 +1,148 @@
+name: Windows Server 2022 + Tailscale RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "Development/debugging session length (1-330 minutes)"
+        required: true
+        default: "120"
+      download_sha256:
+        description: "Optional: verified SHA-256 of Downloads.bat; blank skips download and execution"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rdp-development
+  cancel-in-progress: false
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Validate configuration
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          SESSION_MINUTES: ${{ inputs.duration_minutes }}
+          DOWNLOAD_SHA256: ${{ inputs.download_sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD) -or [string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+            throw 'Set repository secrets RDP_PASSWORD and TAILSCALE_AUTHKEY before running.'
+          }
+          $minutes = 0
+          if (-not [int]::TryParse($env:SESSION_MINUTES, [ref]$minutes) -or $minutes -lt 1 -or $minutes -gt 330) {
+            throw 'duration_minutes must be an integer between 1 and 330.'
+          }
+          if ($env:DOWNLOAD_SHA256 -and $env:DOWNLOAD_SHA256 -notmatch '^[a-fA-F0-9]{64}$') {
+            throw 'download_sha256 must contain exactly 64 hexadecimal characters.'
+          }
+
+      - name: Install signed Tailscale installer
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:TEMP 'tailscale.msi'
+          Invoke-WebRequest 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $installer
+          $signature = Get-AuthenticodeSignature $installer
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Tailscale') {
+            throw 'Tailscale installer signature verification failed.'
+          }
+          $process = Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /quiet /norestart" -Wait -PassThru
+          if ($process.ExitCode -notin @(0, 3010)) { throw "Installer failed: $($process.ExitCode)" }
+          Remove-Item $installer -Force
+
+      - name: Connect to Tailscale
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts up "--auth-key=$env:TAILSCALE_AUTHKEY" "--hostname=gh-dev-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" --timeout=60s
+          if ($LASTEXITCODE -ne 0) { throw 'Tailscale connection failed.' }
+          $ip = (& $ts ip -4 | Select-Object -First 1)
+          if ($LASTEXITCODE -ne 0 -or -not $ip) { throw 'No Tailscale IPv4 address assigned.' }
+          "TAILSCALE_IP=$($ip.Trim())" >> $env:GITHUB_ENV
+
+      - name: Configure RDP with NLA and Tailscale-only firewall
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name SecurityLayer -Value 2
+          Get-NetFirewallRule -Name 'RemoteDesktop*' -ErrorAction SilentlyContinue | Disable-NetFirewallRule
+          Get-NetFirewallRule -DisplayName 'RDP-Tailscale' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+          $adapter = Get-NetAdapter | Where-Object { $_.InterfaceDescription -match 'Tailscale' -or $_.Name -match 'Tailscale' } | Select-Object -First 1
+          if (-not $adapter) { throw 'Tailscale network adapter not found.' }
+          New-NetFirewallRule -DisplayName 'RDP-Tailscale' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -RemoteAddress '100.64.0.0/10' -InterfaceAlias $adapter.Name -Profile Any | Out-Null
+          $pass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          if (Get-LocalUser RDP -ErrorAction SilentlyContinue) {
+            Set-LocalUser RDP -Password $pass
+          } else {
+            New-LocalUser RDP -Password $pass -AccountNeverExpires | Out-Null
+          }
+          Enable-LocalUser RDP
+          foreach ($sid in @('S-1-5-32-544', 'S-1-5-32-555')) {
+            $group = Get-LocalGroup -SID $sid
+            $user = Get-LocalUser RDP
+            if (-not (Get-LocalGroupMember $group.Name | Where-Object { $_.SID -eq $user.SID })) {
+              Add-LocalGroupMember -Group $group.Name -Member RDP
+            }
+          }
+          Restart-Service TermService -Force
+          if (-not (Test-NetConnection $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue).TcpTestSucceeded) {
+            throw 'Local RDP listener check failed.'
+          }
+
+      - name: Optional verified Downloads.bat
+        if: ${{ inputs.download_sha256 != '' }}
+        env:
+          DOWNLOAD_SHA256: ${{ inputs.download_sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = Join-Path $env:TEMP 'Downloads.bat'
+          Invoke-WebRequest 'https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat' -OutFile $path
+          if ((Get-FileHash $path -Algorithm SHA256).Hash -ne $env:DOWNLOAD_SHA256) {
+            Remove-Item $path -Force
+            throw 'Downloads.bat SHA-256 mismatch; execution blocked.'
+          }
+          & cmd.exe /d /c $path
+          if ($LASTEXITCODE -ne 0) { throw "Downloads.bat failed: $LASTEXITCODE" }
+
+      - name: Development session
+        env:
+          SESSION_MINUTES: ${{ inputs.duration_minutes }}
+        run: |
+          @"
+          ## RDP development access
+          - Address: $env:TAILSCALE_IP
+          - Username: RDP
+          - Password: use the value you stored in RDP_PASSWORD.
+          - Connect from a device on the same tailnet with ACL permission for TCP 3389.
+          - This is Windows Server 2022. Files disappear when this hosted job ends.
+          - Cancel this workflow to end the session early.
+          "@ >> $env:GITHUB_STEP_SUMMARY
+          $deadline = (Get-Date).AddMinutes([int]$env:SESSION_MINUTES)
+          while ((Get-Date) -lt $deadline) {
+            Write-Host "Development session active: $(Get-Date -Format o)"
+            Start-Sleep -Seconds 30
+          }
+
+      - name: Cleanup
+        if: always()
+        run: |
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 1 -ErrorAction Continue
+          Get-NetFirewallRule -DisplayName 'RDP-Tailscale' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+          Disable-LocalUser RDP -ErrorAction SilentlyContinue
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $ts) { & $ts logout }
