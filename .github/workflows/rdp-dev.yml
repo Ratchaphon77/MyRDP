@@ -1,4 +1,4 @@
-name: Windows Server 2022 + Tailscale RDP
+name: Windows Server 2025 + Tailscale RDP
 
 on:
   workflow_dispatch:
@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   secure-rdp:
-    runs-on: windows-2022
+    runs-on: windows-2025
     timeout-minutes: 350
     defaults:
       run:
@@ -129,7 +129,7 @@ jobs:
           - Username: RDP
           - Password: use the value you stored in RDP_PASSWORD.
           - Connect from a device on the same tailnet with ACL permission for TCP 3389.
-          - This is Windows Server 2022. Files disappear when this hosted job ends.
+          - This is Windows Server 2025. Files disappear when this hosted job ends.
           - Cancel this workflow to end the session early.
           "@ >> $env:GITHUB_STEP_SUMMARY
           $deadline = (Get-Date).AddMinutes([int]$env:SESSION_MINUTES)
